@@ -47,7 +47,7 @@ Raspberry Pi で外付けまたは内蔵Bluetoothデバイス（例：HC-06、�
 
 ```bash
 sudo apt update
-sudo apt install -y bluez bluez-tools rfcomm python3-serial
+sudo apt install -y bluez bluez-tools python3-serial
 ```
 
 `python3-serial` は通信確認用 Python スクリプトで `pyserial` を利用するためのパッケージです。
