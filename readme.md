@@ -2,7 +2,7 @@
 
 **目的**
 
-このドキュメントは、Raspberry Pi OS（Bookworm / Bullseye）上で Bluetooth SPP (Serial Port Profile) を安定して運用するための、初心者向けかつ精緻な手順書です。起動時の自動接続、自動ペアリング、`/dev/rfcomm0` の扱い、切断時の再接続（ポーリング式とイベントドリブン式）まで、これまでの会話の流れを省略せず再現しています。
+このドキュメントは、Raspberry Pi OS（Bookworm / Bullseye）上で Bluetooth SPP (Serial Port Profile) を安定して運用するための、初心者向け手順書です。起動時の自動接続、自動ペアリング、`/dev/rfcomm0` の扱い、切断時の再接続（ポーリング式とイベントドリブン式）まで記載しています。
 
 ---
 
@@ -412,7 +412,7 @@ A3: スクリプトが短い間隔で無限ループして `rfcomm` をひっき
 
 **作成日:** 2025-11-12
 
-**作成者:** ChatGPT（GPT-5 Thinking mini） とユーザー会話ログに基づく
+**作成者:** ChatGPT（GPT-5 Thinking mini） とAkihiko Fujiとの会話に基づく
 
 
 ---
