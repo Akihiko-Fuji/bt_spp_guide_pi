@@ -41,13 +41,14 @@ Raspberry Pi で外付けまたは内蔵Bluetoothデバイス（例：HC-06、�
 - Raspberry Pi OS (Bullseye / Bookworm 等、2025年時点の一般的な版)
 - root または sudo 権限を持つユーザー
 - Python 3 (推奨: 3.8+)
-- パッケージ: bluez, bluez-tools, rfcomm (インストール手順は下記)
+- パッケージ: bluez, bluez-tools, blueman (インストール手順は下記)
+- どうもBlueZでのSPP通信はうまくいかないので、bluemanを基軸に設定する
 
 まずパッケージを更新・インストールします：
 
 ```bash
 sudo apt update
-sudo apt install -y bluez bluez-tools python3-serial
+sudo apt install -y bluez bluez-tools python3-serial blueman 
 ```
 
 `python3-serial` は通信確認用 Python スクリプトで `pyserial` を利用するためのパッケージです。
@@ -168,129 +169,134 @@ rfcomm0 {
 ```python
 #!/usr/bin/env python3
 """
-bt_auto_connect.py
+bt_auto_connect.py - Blueman 相当の自動接続スクリプト
 
-シンプルで堅牢な rfcomm 自動再接続スクリプト
-- rfcomm bind を試行し、失敗時は間隔をあけて再試行
-- ログは /var/log/bt_auto_connect.log に出力
-- systemd で管理する想定
+機能:
+- 自動ペアリング
+- SPP チャンネル自動検出
+- rfcomm0 自動作成
+- 再接続ループ (指数バックオフ + ジッタ)
+- ログ: /tmp/bt_auto_connect.log
+- sudo pip3 install dbus-next --break-system-packages しておいてください。
 """
 
-import subprocess
-import time
+import asyncio
 import logging
 import os
 import random
+import subprocess
+import sys
+from dbus_next.aio import MessageBus
+from dbus_next.constants import BusType
+from dbus_next.errors import DBusError
 
-# ----- 設定値 -----
-BT_ADDR = "00:11:22:33:44:55"  # 実際のデバイスMACに置換
-CHANNEL = "1"                  # sdptool で確認
-RFCOMM_IDX = 0                  # /dev/rfcomm{RFCOMM_IDX}
-RFCOMM_DEV = f"/dev/rfcomm{RFCOMM_IDX}"
-RETRY_INTERVAL = 10             # 基本の待ち時間（秒）
-MAX_RETRIES_BEFORE_BACKOFF = 6  # この回数で指数バックオフを開始
-MAX_RETRIES = 0                 # 0 = 無制限
-LOGFILE = "/var/log/bt_auto_connect.log"
+# ----- 設定 -----
+BT_ADDR = "AA:A8:02:04:D3:A1" # MACアドレスは機器に合わせて設定
+RFCOMM_DEV = "/dev/rfcomm0"
+LOGFILE = "/tmp/bt_auto_connect.log"
+RETRY_INTERVAL = 10           # 秒
+MAX_RETRIES_BEFORE_BACKOFF = 6
+MAX_RETRIES = 0               # 0 = 無制限
 
-# ----- ログ設定 -----
+# ログ設定
 logging.basicConfig(
     filename=LOGFILE,
     level=logging.INFO,
     format='%(asctime)s [%(levelname)s] %(message)s'
 )
 
-
-def is_bound():
-    """rfcomm が既にバインド済みか確認（RFCOMM_DEV が存在）"""
-    return os.path.exists(RFCOMM_DEV)
-
-
-def bind_rfcomm():
-    """rfcomm bind を実行。成功 True/False を返す"""
+# SDP から SPP チャンネルを自動検出
+async def get_spp_channel(bus, device_path):
     try:
-        # 念のため一度 release をかける
-        subprocess.run(["rfcomm", "release", str(RFCOMM_IDX)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        obj = await bus.get_proxy_object('org.bluez', device_path, None)
+        services = await obj.call_get_managed_objects()
+        # RFCOMM チャンネルを返す簡易処理
+        for path, ifaces in services.items():
+            for iface, props in ifaces.items():
+                if 'org.bluez.SerialPort' in iface or 'org.bluez.Rfcomm' in iface:
+                    return props.get('Channel', 1)
+        # デフォルト 1 チャンネル
+        return 1
+    except Exception as e:
+        logging.warning(f"SPP channel autodetect failed: {e}")
+        return 1
+
+# ペアリングして trusted にする
+async def ensure_paired(bus):
+    device_path = f"/org/bluez/hci0/dev_{BT_ADDR.replace(':','_')}"
+    try:
+        obj = await bus.get_proxy_object('org.bluez', device_path, None)
+        props_iface = obj.get_interface('org.freedesktop.DBus.Properties')
+        paired = await props_iface.get('org.bluez.Device1', 'Paired')
+        if not paired:
+            logging.info("Device not paired. Attempting pair...")
+            device = obj.get_interface('org.bluez.Device1')
+            await device.Pair()
+            logging.info("Paired successfully")
+        await props_iface.set('org.bluez.Device1', 'Trusted', True)
+        logging.info("Device set as trusted")
+    except DBusError as e:
+        logging.warning(f"ensure_paired DBusError: {e}")
+    except Exception as e:
+        logging.warning(f"ensure_paired error: {e}")
+    return device_path
+
+# rfcomm bind を実行
+def bind_rfcomm(channel):
+    try:
+        subprocess.run(['rfcomm', 'release', '0'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except Exception:
         pass
-
     try:
-        subprocess.run(["rfcomm", "bind", str(RFCOMM_IDX), BT_ADDR, CHANNEL], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.run(['sudo', 'rfcomm', 'bind', '0', BT_ADDR, str(channel)], check=True)
         logging.info(f"rfcomm bind succeeded: {RFCOMM_DEV}")
         return True
     except subprocess.CalledProcessError as e:
         logging.warning(f"rfcomm bind failed: {e}")
         return False
 
-
-def release_rfcomm():
-    try:
-        subprocess.run(["rfcomm", "release", str(RFCOMM_IDX)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        logging.info("rfcomm released (clean)")
-    except Exception:
-        pass
-
-
-def auto_reconnect():
+async def auto_reconnect_loop():
+    bus = await MessageBus(bus_type=BusType.SYSTEM).connect()
     retries = 0
     while True:
-        if is_bound():
-            # 既に接続済みなら少し待機
-            logging.debug("Device appears bound; sleeping")
-            time.sleep(5)
+        device_path = await ensure_paired(bus)
+        channel = await get_spp_channel(bus, device_path)
+        if os.path.exists(RFCOMM_DEV):
+            # 接続済みなら待機
+            await asyncio.sleep(5)
             continue
-
-        logging.info("Device not bound; attempt to bind...")
-        success = bind_rfcomm()
+        logging.info(f"Attempting rfcomm bind on channel {channel}")
+        success = bind_rfcomm(channel)
         if success:
             retries = 0
-            # 余裕をもって接続後の安定時間を確保
-            time.sleep(2)
+            await asyncio.sleep(2)
             continue
-
-        # 失敗した場合の待機とバックオフ
+        # 失敗時バックオフ
         retries += 1
-        logging.warning(f"Bind attempt failed (#{retries})")
-
         if MAX_RETRIES > 0 and retries >= MAX_RETRIES:
             logging.error("Reached MAX_RETRIES; exiting")
             break
-
-        # エクスポネンシャルバックオフ（ただし最大60秒）
-        backoff = min(60, RETRY_INTERVAL * (2 ** max(0, (retries // MAX_RETRIES_BEFORE_BACKOFF))))
-        # ジッタを入れて同時攻撃を避ける
+        backoff = min(60, RETRY_INTERVAL * (2 ** max(0, retries // MAX_RETRIES_BEFORE_BACKOFF)))
         jitter = random.uniform(0, 2)
         sleep_time = backoff + jitter
-        logging.info(f"Sleeping for {sleep_time:.1f}s before next retry")
-        time.sleep(sleep_time)
+        logging.info(f"Sleeping {sleep_time:.1f}s before retry")
+        await asyncio.sleep(sleep_time)
 
-
-if __name__ == '__main__':
+if __name__ == "__main__":
     logging.info("Starting bt_auto_connect service")
-    release_rfcomm()
     try:
-        auto_reconnect()
+        asyncio.run(auto_reconnect_loop())
     except KeyboardInterrupt:
         logging.info("bt_auto_connect interrupted by user")
-        release_rfcomm()
+
 
 ```
 
 ### 解説（初心者向け）
-
-- `rfcomm bind` に失敗しても即リトライせず、指数バックオフ＋ジッタで再試行するため**CPU暴走を防ぐ**。
-- `/var/log/bt_auto_connect.log` に状態が残るのでデバッグが容易。
 - `MAX_RETRIES=0` は無制限リトライ。必要なら上限を設定できます。
 
 ---
 
-## 8. より堅牢な接続管理（改善版）
-
-上記スクリプトをベースに、さらに以下の改善が可能：
-
-- **ログローテーション**: `/etc/logrotate.d/bt_auto_connect` を作成してログ肥大を管理
-- **非rootユーザーでの実行**: rfcomm を実行するには root 権限が必要だが、systemd の `User=root` を使わずに `Capability` を付与する方法もある（上級）
-- **接続失敗時の通知**: systemd の `OnFailure=` や自前でメール送信／Slack通知
-- **デバイスの電源管理との協調**: デバイスが電源断→再投入される場合のタイミング調整
 
 ---
 
@@ -302,16 +308,17 @@ if __name__ == '__main__':
 
 ```ini
 [Unit]
-Description=Bluetooth SPP auto-connect
-After=bluetooth.service
-Requires=bluetooth.service
+Description=Auto Bluetooth SPP Connect Service
+After=bluetooth.target
+Requires=bluetooth.target
 
 [Service]
 Type=simple
 ExecStart=/usr/bin/python3 /usr/local/bin/bt_auto_connect.py
 Restart=always
-RestartSec=5
+RestartSec=10
 User=root
+# rfcomm0 作成のため root 必須
 
 [Install]
 WantedBy=multi-user.target
@@ -323,101 +330,14 @@ WantedBy=multi-user.target
 sudo systemctl daemon-reload
 sudo systemctl enable bt-auto-connect.service
 sudo systemctl start bt-auto-connect.service
-sudo journalctl -u bt-auto-connect -f
+
 ```
 
-`Restart=always` と `RestartSec=5` により、スクリプトが落ちても自動で再起動されます。
-
-### 9.2 rfcomm を systemd で直接 bind する One-shot サービス
-
-この場合は `/usr/bin/rfcomm bind ...` を直接実行する oneshot サービスを作る方法もあります（接続が切れたときに自動で復活しない点に注意）。
-
 ---
 
-## 10. イベントドリブン（D-Bus）方式のサンプル
+**作成日:** 2025-11-13
 
-ポーリングを避け、BlueZ の D-Bus イベントに反応して再接続する方法（CPU負荷がほぼゼロ）。
-
-以下は概念的なサンプル（`dbus-next` や `pydbus` を使う想定）。
-
-> 注意: 下記はサンプルコードであり、環境により調整が必要。依存ライブラリを事前にインストールしてください（例: `pip3 install dbus-next`）。
-
-```python
-# event_reconnect.py (概念サンプル)
-import asyncio
-from dbus_next.aio import MessageBus
-from dbus_next.constants import MessageType
-
-async def main():
-    bus = await MessageBus().connect()
-    introspect = await bus.introspect('org.bluez', '/')
-    # ここで org.bluez のオブジェクトを監視し、Device の PropertiesChanged を subscribe
-    # 切断イベントを受けたら rfcomm bind を行う処理を起動
-
-if __name__ == '__main__':
-    asyncio.run(main())
-```
-
-イベントドリブン実装はポーリングより確実かつ軽量ですが、やや難易度が高いので、まずはポーリング式で運用開始し、安定後に移行することを推奨します。
-
----
-
-## 11. ログとトラブルシューティング
-
-### 11.1 主要ログの場所
-
-- BlueZ デーモン: `journalctl -u bluetooth` または `sudo journalctl -b | grep bluetooth`
-- bt_auto_connect ログ: `/var/log/bt_auto_connect.log`
-- systemd 単体: `journalctl -u bt-auto-connect`
-
-### 11.2 よくある症状と対処
-
-- **/dev/rfcomm0 が作成されない**
-  - sdptool で `Serial Port` が登録されているか確認
-  - rfcomm.conf の MAC と Channel を再確認
-  - `rfcomm bind` を手動で実行し、エラーを確認
-
-- **接続試行が短時間に何度も発生して SSH が切れる**
-  - スクリプトの `time.sleep()` を長めに設定（例: 10〜30秒）
-  - systemd の `RestartSec` を調整
-
-- **ペアリングがうまくいかない**
-  - `bluetoothctl` で `agent on` と `default-agent` を使い、手動で一度ペアリング
-  - PIN 認証がある場合は適切に入力
-
----
-
-## 12. FAQ
-
-**Q1: --compat を付けたほうがいいですか？**
-A1: 2025年現在の一般的な Raspberry Pi OS では不要。状況に応じて使われることもあるが、まずは `sdptool add SP` と `Enable=Socket` で試す。
-
-**Q2: rfcomm.conf と rfcomm bind、どちらが良い？**
-A2: rfcomm.conf は便利だが BlueZ のバージョンによっては確実に動かないことがある。確実性を求めるなら systemd の ExecStart で `rfcomm bind` を明示実行するのが良い。
-
-**Q3: 接続試行中に SSH が切断される原因は？**
-A3: スクリプトが短い間隔で無限ループして `rfcomm` をひっきりなしに呼ぶことが原因。sleep とバックオフで解決する。
-
----
-
-## 13. 付録：ファイル一覧（作成・編集推奨）
-
-- `/etc/bluetooth/main.conf` (編集)
-- `/etc/bluetooth/rfcomm.conf` (作成)
-- `/usr/local/bin/bt_auto_connect.py` (作成)
-- `/etc/systemd/system/bt-auto-connect.service` (作成)
-- (任意) `/usr/local/bin/event_reconnect.py` (D-Bus 実装)
-
----
-
-**作成日:** 2025-11-12
-
-**作成者:** ChatGPT（GPT-5 Thinking mini） とAkihiko Fujiとの会話に基づく
+**作成者:** Akihiko Fuji
 
 
----
-
-# 末尾メモ
-
-必要であれば、上記のファイルを個別に生成して配置するためのシェルスクリプトも作成します。希望があればそのまま用意します。
 
