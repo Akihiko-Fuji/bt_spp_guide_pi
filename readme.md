@@ -25,6 +25,7 @@
 ---
 
 ## 1. 概要
+WindowsでBluetoothを扱うのは比較的容易で、ペアリングさえおこなえば利用可能となるのですが、Raspberry Pi OS (DebianベースのLinux)では、Bluetoothに対するSPP接続のためのドライバ(プロトコルスタック)が有効化されていないため、ペアリングしても動作させることが出来ない（経験上、プロトコルスタックを有効にしても適切に機能しません）。また、Windowsのように起動時にオートコネクトする機能や切断時に自動で再接続する機能が、起動後に手動でペアリングとコネクトをおこなわないとデバイスを利用することが出来ない仕様となっている。
 
 Raspberry Pi で外付けまたは内蔵Bluetoothデバイス（例：HC-06、産業用SPP機器、バーコードスキャナ）と SPP 通信を行うときに必要な設定と運用方法をまとめる。特に以下を満たすことを目的とする：
 
@@ -61,6 +62,9 @@ sudo apt install -y bluez bluez-tools python3-serial blueman
 - **SPP (Serial Port Profile)** は RFCOMM を使用して仮想シリアルポート（`/dev/rfcomm0` 等）を提供するプロファイル。
 - 近年の BlueZ では `serial` というプラグイン名は廃止され、代わりに `socket`（Socket プロファイル）を有効化することで RFCOMM/SPP 機能が利用可能。
 
+blueman導入後にはXwindow上のタブにマネージャーのアイコンが追加されます。機能が重複しますので古いBluetoothの管理アイコンは消しておくのが適切です。
+インストール後に、bluemanから、リーダーとペアリングを行ない、シリアル通信の自動接続のチェックボックスを入れて下さい（チェックボックスを入れても、残念ながらそれだけでは自動接続が出来ません）ペアリング実施後にはファイルマネージャ(PCmanFM)から /dev/rfcomm* が出現していることを確認してください。
+
 重要: `bluetoothd --compat` は古いケースで使われていたが、現行ディストロの BlueZ では**不要・場合によっては問題**になる。詳しくはセクション4。
 
 ---
@@ -85,8 +89,19 @@ sudo apt install -y bluez bluez-tools python3-serial blueman
 systemctl status bluetooth
 bluetoothd -v  # BlueZ のバージョン確認
 ```
+### Bluetooth SPP接続処理の優先度を高める
+dmesgを利用して標準のセットアップ状態での起動処理のロード時間見ると、全モジュールが20秒以内でロードされているのに対し、Bluetooth RFCOMM TTYのロードに40秒ほど掛かっているのが正常です(Pi Zero 2Wの場合)よりトラブル無く動作させるために、ドライバのロードの優先度を変更します。
+ /etc/modules-load.d/modules.conf に、ロードの優先度を高めるため編集します
+```bash
+sudo nano /etc/modules-load.d/modules.conf
+```
+追記内容は下記の情報をi2c-devの上の行に追記します。
+```bash
+rfcomm
+```
+これにより、呼び出しの優先度が高くなり、起動後早い時点でモジュールがロードされるようになる為、以降の処理でモジュールがロードされておらず上手く動かないという障害を避けることが出来ます。
 
-### 5.2 SPP サービス登録（SDP へ追加）
+### 5.3 SPP サービス登録（SDP へ追加）
 
 ```bash
 sudo sdptool add SP
@@ -96,7 +111,7 @@ sudo sdptool browse local | less
 
 出力内に `Service Name: Serial Port` が表示され、`Protocol Descriptor List` に `RFCOMM` と `Channel` が見えればOK。
 
-### 5.3 デバイスのペアリング（初回1回）
+### 5.4 デバイスのペアリング（初回1回）
 
 ```bash
 bluetoothctl
