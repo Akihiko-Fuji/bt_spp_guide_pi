@@ -1,4 +1,4 @@
-# Raspberry Pi Bluetooth SPP 完全ガイド（2025年版）
+# Raspberry Pi Bluetooth SPP 不完全ガイド（2025年版）
 
 **目的**
 
